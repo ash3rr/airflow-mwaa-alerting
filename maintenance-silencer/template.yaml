@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Maintenance-window silencer for Airflow failure alerts. Subscribes a Lambda
+  to the existing alert SNS topic, drops alerts for DAGs with an active window
+  in SSM Parameter Store, and forwards everything else to a Slack webhook.
+
+Parameters:
+  AlertTopicArn:
+    Type: String
+    Description: ARN of the SNS topic that Airflow failure callbacks publish to.
+  SlackWebhookSecretArn:
+    Type: String
+    Description: >
+      ARN of the Secrets Manager secret holding the Slack incoming-webhook URL,
+      either as a plain string or as JSON with the URL under SlackWebhookSecretKey.
+  SlackWebhookSecretKey:
+    Type: String
+    Default: webhook_url
+    Description: JSON key inside the secret, ignored when the secret is a plain URL.
+  EnvironmentLabel:
+    Type: String
+    Default: dev
+    Description: Short label shown in Slack titles and used as the metric dimension.
+  MaintenancePrefix:
+    Type: String
+    Default: /airflow/maintenance
+    AllowedPattern: "^/[A-Za-z0-9_./-]*[A-Za-z0-9_.-]$"
+    Description: SSM parameter path holding one parameter per silenced DAG. No trailing slash.
+  MetricNamespace:
+    Type: String
+    Default: Airflow/Alerting
+  DeleteExpiredWindows:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Delete a window's parameter when an alert arrives after it has expired.
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+
+Conditions:
+  CanDeleteExpired: !Equals [!Ref DeleteExpiredWindows, "true"]
+
+Resources:
+  SilencerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  SilencerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Drops Airflow alerts for DAGs in a maintenance window, forwards the rest to Slack.
+      CodeUri: src/
+      Handler: silencer.handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 30
+      LoggingConfig:
+        LogGroup: !Ref SilencerLogGroup
+      # SNS invokes Lambda asynchronously. Two retries cover a brief Slack
+      # outage. Anything still failing lands in the queue instead of vanishing.
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt SilencerDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          MAINTENANCE_PREFIX: !Ref MaintenancePrefix
+          SLACK_WEBHOOK_SECRET_ID: !Ref SlackWebhookSecretArn
+          SLACK_WEBHOOK_SECRET_KEY: !Ref SlackWebhookSecretKey
+          ENVIRONMENT_LABEL: !Ref EnvironmentLabel
+          METRIC_NAMESPACE: !Ref MetricNamespace
+          DELETE_EXPIRED_WINDOWS: !Ref DeleteExpiredWindows
+      Policies:
+        - Statement:
+            - Sid: ReadMaintenanceWindows
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MaintenancePrefix}/*"
+            - Sid: ReadSlackWebhook
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref SlackWebhookSecretArn
+        - !If
+          - CanDeleteExpired
+          - Statement:
+              - Sid: DeleteExpiredWindows
+                Effect: Allow
+                Action: ssm:DeleteParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MaintenancePrefix}/*"
+          - !Ref AWS::NoValue
+      Events:
+        AirflowAlerts:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlertTopicArn
+
+  SilencerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  FunctionName:
+    Value: !Ref SilencerFunction
+  DeadLetterQueueUrl:
+    Value: !Ref SilencerDeadLetterQueue
+  SuppressedAlertsMetric:
+    Description: Metric emitted once per suppressed alert.
+    Value: !Sub "${MetricNamespace} / SuppressedAlerts (dimensions Environment, DagId)"

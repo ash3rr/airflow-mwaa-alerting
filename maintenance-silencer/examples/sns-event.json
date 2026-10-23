@@ -1,0 +1,13 @@
+{
+  "Records": [
+    {
+      "EventSource": "aws:sns",
+      "Sns": {
+        "Type": "Notification",
+        "Subject": "Airflow task failed: sales_daily.wait_for_parsing",
+        "Message": "{\"dag_id\": \"sales_daily\", \"task_id\": \"wait_for_parsing\", \"run_id\": \"scheduled__2026-05-10T05:00:00+00:00\", \"try_number\": 3, \"logical_date\": \"2026-05-10T05:00:00+00:00\", \"exception\": \"Sensor has timed out; run duration of 908.3 seconds exceeds the specified timeout of 900.0.\", \"log_url\": \"https://example.com/airflow/log\"}",
+        "Timestamp": "2026-05-10T05:20:00.000Z"
+      }
+    }
+  ]
+}

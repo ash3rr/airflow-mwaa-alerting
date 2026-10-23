@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Scheduled check that counts running Airflow DAG runs in one or more MWAA
+  environments and posts to Slack when the count is above a threshold.
+  Uses the MWAA InvokeRestApi API, so no Airflow credentials are stored.
+
+Parameters:
+  MwaaEnvironments:
+    Type: String
+    Description: >
+      Comma-separated label=environment-name pairs, for example
+      "dev=analytics-dev,preprod=analytics-preprod". All must be in this account and Region.
+  MwaaEnvironmentNames:
+    Type: CommaDelimitedList
+    Description: >
+      The same MWAA environment names as a plain list, used to scope the IAM
+      policy, for example "analytics-dev,analytics-preprod".
+  AirflowRole:
+    Type: String
+    Default: Viewer
+    AllowedValues: [Viewer, User, Op, Admin]
+    Description: Airflow role the Lambda acts as. Listing DAG runs needs only Viewer.
+  Threshold:
+    Type: Number
+    Default: 10
+    MinValue: 0
+  CountBy:
+    Type: String
+    Default: runs
+    AllowedValues: [runs, dags]
+    Description: Compare the threshold with running DAG runs, or with distinct DAGs that have a running run.
+  Schedule:
+    Type: String
+    Default: rate(15 minutes)
+  CooldownMinutes:
+    Type: Number
+    Default: 60
+    Description: Minimum minutes between alerts for the same environment. 0 alerts on every check.
+  SlackWebhookSecretArn:
+    Type: String
+  SlackWebhookSecretKey:
+    Type: String
+    Default: webhook_url
+  StatePrefix:
+    Type: String
+    Default: /airflow/running-dag-alert
+    AllowedPattern: "^/[A-Za-z0-9_./-]*[A-Za-z0-9_.-]$"
+  MetricNamespace:
+    Type: String
+    Default: Airflow/Alerting
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic notified when the check itself keeps failing.
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+
+Resources:
+  RunningDagAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Counts running DAG runs per MWAA environment and alerts above a threshold.
+      CodeUri: src/
+      Handler: running_dag_alert.handler.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 120
+      LoggingConfig:
+        LogGroup: !Ref RunningDagAlertLogGroup
+      Environment:
+        Variables:
+          MWAA_ENVIRONMENTS: !Ref MwaaEnvironments
+          THRESHOLD: !Ref Threshold
+          COUNT_BY: !Ref CountBy
+          COOLDOWN_MINUTES: !Ref CooldownMinutes
+          STATE_PREFIX: !Ref StatePrefix
+          SLACK_WEBHOOK_SECRET_ID: !Ref SlackWebhookSecretArn
+          SLACK_WEBHOOK_SECRET_KEY: !Ref SlackWebhookSecretKey
+          METRIC_NAMESPACE: !Ref MetricNamespace
+      Policies:
+        - Statement:
+            - Sid: InvokeAirflowRestApi
+              Effect: Allow
+              Action: airflow:InvokeRestApi
+              Resource: !Split
+                - ","
+                - !Sub
+                  - "arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:role/${Joined}/${AirflowRole}"
+                  - Joined: !Join
+                      - !Sub "/${AirflowRole},arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:role/"
+                      - !Ref MwaaEnvironmentNames
+            - Sid: DescribeEnvironments
+              Effect: Allow
+              Action: airflow:GetEnvironment
+              Resource: !Split
+                - ","
+                - !Sub
+                  - "arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/${Joined}"
+                  - Joined: !Join
+                      - !Sub ",arn:${AWS::Partition}:airflow:${AWS::Region}:${AWS::AccountId}:environment/"
+                      - !Ref MwaaEnvironmentNames
+            - Sid: AlertState
+              Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${StatePrefix}/*"
+            - Sid: ReadSlackWebhook
+              Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref SlackWebhookSecretArn
+      Events:
+        Check:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref Schedule
+            RetryPolicy:
+              MaximumRetryAttempts: 0
+
+  RunningDagAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Alarm on the check itself failing, so a broken check does not look like
+  # a quiet environment.
+  CheckFailingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The running-DAG check Lambda is failing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RunningDagAlertFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: 2
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+Outputs:
+  FunctionName:
+    Value: !Ref RunningDagAlertFunction
+  Metrics:
+    Value: !Sub "${MetricNamespace} / RunningDagRuns and RunningDags (dimension Environment)"
